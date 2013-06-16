@@ -28,7 +28,10 @@
 -include("eredis.hrl").
 
 %% API
--export([start_link/5, stop/1, select_database/2]).
+-export([start_link/5, stop/1, select_database/2,
+         dump_state/1,
+         queue_size/1
+        ]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -43,7 +46,8 @@
 
           socket :: port() | undefined,
           parser_state :: #pstate{} | undefined,
-          queue :: queue() | undefined
+          queue :: queue() | undefined,
+          queue_size :: integer | undefined
 }).
 
 %%
@@ -63,6 +67,12 @@ start_link(Host, Port, Database, Password, ReconnectSleep) ->
 stop(Pid) ->
     gen_server:call(Pid, stop).
 
+dump_state(Pid) ->
+    gen_server:call(Pid, dump_state).
+
+queue_size(Pid) ->
+    gen_server:call(Pid, queue_size).
+
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -75,7 +85,8 @@ init([Host, Port, Database, Password, ReconnectSleep]) ->
                    reconnect_sleep = ReconnectSleep,
 
                    parser_state = eredis_parser:init(),
-                   queue = queue:new()},
+                   queue = queue:new(),
+                   queue_size = 0 },
 
     case connect(State) of
         {ok, NewState} ->
@@ -92,6 +103,12 @@ handle_call({pipeline, Pipeline}, From, State) ->
 
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State};
+
+handle_call(dump_state, _From, State) ->
+    {reply, State, State};
+
+handle_call(queue_size, _From, #state{queue_size = Size} = State) ->
+    {reply, Size, State};
 
 handle_call(_Request, _From, State) ->
     {reply, unknown_request, State}.
@@ -148,7 +165,7 @@ handle_info({tcp_closed, _Socket}, #state{queue = Queue} = State) ->
     %% Throw away the socket and the queue, as we will never get a
     %% response to the requests sent on the old socket. The absence of
     %% a socket is used to signal we are "down"
-    {noreply, State#state{socket = undefined, queue = queue:new()}};
+    {noreply, State#state{socket = undefined, queue = queue:new(), queue_size = 0}};
 
 %% Redis is ready to accept requests, the given Socket is a socket
 %% already connected and authenticated.
@@ -184,11 +201,17 @@ code_change(_OldVsn, State, _Extra) ->
 do_request(_Req, _From, #state{socket = undefined} = State) ->
     {reply, {error, no_connection}, State};
 
-do_request(Req, From, State) ->
+do_request(Req, From, #state{queue_size = Size} = State) ->
     case gen_tcp:send(State#state.socket, Req) of
         ok ->
             NewQueue = queue:in({1, From}, State#state.queue),
-            {noreply, State#state{queue = NewQueue}};
+            case Size >= 10 of
+                true ->
+                    error_logger:info_msg("~p eredis queue at ~p~n", [self(), Size]);
+                false ->
+                    ok
+            end,
+            {noreply, State#state{queue = NewQueue, queue_size = Size + 1}};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end.
@@ -200,11 +223,11 @@ do_request(Req, From, State) ->
 do_pipeline(_Pipeline, _From, #state{socket = undefined} = State) ->
     {reply, {error, no_connection}, State};
 
-do_pipeline(Pipeline, From, State) ->
+do_pipeline(Pipeline, From, #state{queue_size = Size} = State) ->
     case gen_tcp:send(State#state.socket, Pipeline) of
         ok ->
             NewQueue = queue:in({length(Pipeline), From, []}, State#state.queue),
-            {noreply, State#state{queue = NewQueue}};
+            {noreply, State#state{queue = NewQueue, queue_size = Size + 1}};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end.
@@ -214,21 +237,24 @@ do_pipeline(Pipeline, From, State) ->
 %% and replying to the correct client, handling partial responses,
 %% handling too much data and handling continuations.
 handle_response(Data, #state{parser_state = ParserState,
-                             queue = Queue} = State) ->
+                             queue = Queue,
+                             queue_size = Size} = State) ->
 
     case eredis_parser:parse(ParserState, Data) of
         %% Got complete response, return value to client
         {ReturnCode, Value, NewParserState} ->
-            NewQueue = reply({ReturnCode, Value}, Queue),
+            {NewQueue, R} = reply({ReturnCode, Value}, Queue),
             State#state{parser_state = NewParserState,
-                        queue = NewQueue};
+                        queue = NewQueue,
+                        queue_size = Size - R};
 
         %% Got complete response, with extra data, reply to client and
         %% recurse over the extra data
         {ReturnCode, Value, Rest, NewParserState} ->
-            NewQueue = reply({ReturnCode, Value}, Queue),
+            {NewQueue, R} = reply({ReturnCode, Value}, Queue),
             handle_response(Rest, State#state{parser_state = NewParserState,
-                                              queue = NewQueue});
+                                              queue = NewQueue,
+                                              queue_size = Size - R});
 
         %% Parser needs more data, the parser state now contains the
         %% continuation data and we will try calling parse again when
@@ -245,12 +271,12 @@ reply(Value, Queue) ->
     case queue:out(Queue) of
         {{value, {1, From}}, NewQueue} ->
             safe_reply(From, Value),
-            NewQueue;
+            {NewQueue, 1};
         {{value, {1, From, Replies}}, NewQueue} ->
             safe_reply(From, lists:reverse([Value | Replies])),
-            NewQueue;
+            {NewQueue, 1};
         {{value, {N, From, Replies}}, NewQueue} when N > 1 ->
-            queue:in_r({N - 1, From, [Value | Replies]}, NewQueue);
+            {queue:in_r({N - 1, From, [Value | Replies]}, NewQueue), 0};
         {empty, Queue} ->
             %% Oops
             error_logger:info_msg("Nothing in queue, but got value from parser~n"),
